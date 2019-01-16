@@ -1,5 +1,5 @@
 /**
- * 
+ *
  */
 package com.bellszhu.elasticsearch.plugin.synonym.analysis;
 
@@ -7,6 +7,7 @@ import org.apache.http.client.config.RequestConfig;
 import org.apache.http.client.methods.CloseableHttpResponse;
 import org.apache.http.client.methods.HttpGet;
 import org.apache.http.client.methods.HttpHead;
+import org.apache.http.client.methods.HttpUriRequest;
 import org.apache.http.impl.client.CloseableHttpClient;
 import org.apache.http.impl.client.HttpClients;
 import org.apache.logging.log4j.Logger;
@@ -15,22 +16,27 @@ import org.apache.lucene.analysis.synonym.SolrSynonymParser;
 import org.apache.lucene.analysis.synonym.SynonymMap;
 import org.apache.lucene.analysis.synonym.WordnetSynonymParser;
 import org.apache.logging.log4j.LogManager;
+import java.io.StringReader;
 import org.elasticsearch.env.Environment;
 
 import java.io.BufferedReader;
 import java.io.IOException;
 import java.io.InputStreamReader;
 import java.io.Reader;
+import java.security.AccessController;
+import java.security.PrivilegedAction;
+import java.text.ParseException;
 
 /**
  * @author bellszhu
- *
  */
 public class RemoteSynonymFile implements SynonymFile {
+    private static final String LAST_MODIFIED_HEADER = "Last-Modified";
+    private static final String ETAG_HEADER = "ETag";
 
 	public static Logger logger = LogManager.getLogger("dynamic-synonym");
 
-	private CloseableHttpClient httpclient = HttpClients.createDefault();
+	private CloseableHttpClient httpclient;
 
 	private String format;
 
@@ -40,13 +46,11 @@ public class RemoteSynonymFile implements SynonymFile {
 
 	private Environment env;
 
-	/** 远程url地址 */
+    /**
+     * Remote URL address
+     */
 	private String location;
-
-	/** 上次更改时间 */
 	private String lastModified;
-
-	/** 资源属性 */
 	private String eTags;
 
 	public RemoteSynonymFile(Environment env, Analyzer analyzer,
@@ -56,9 +60,23 @@ public class RemoteSynonymFile implements SynonymFile {
 		this.format = format;
 		this.env = env;
 		this.location = location;
+        this.httpclient = AccessController.doPrivileged((PrivilegedAction<CloseableHttpClient>) HttpClients::createDefault);
 
 		isNeedReloadSynonymMap();
 	}
+
+    static SynonymMap.Builder getSynonymParser(Reader rulesReader, String format, boolean expand, Analyzer analyzer) throws IOException, ParseException {
+        SynonymMap.Builder parser;
+        if ("wordnet".equalsIgnoreCase(format)) {
+            parser = new WordnetSynonymParser(true, expand, analyzer);
+            ((WordnetSynonymParser) parser).parse(rulesReader);
+        } else {
+            parser = new SolrSynonymParser(true, expand, analyzer);
+            ((SolrSynonymParser) parser).parse(rulesReader);
+        }
+        return parser;
+    }
+
 
 	@Override
 	public SynonymMap reloadSynonymMap() {
@@ -66,15 +84,7 @@ public class RemoteSynonymFile implements SynonymFile {
 		try {
 			logger.info("start reload remote synonym from {}.", location);
 			rulesReader = getReader();
-			SynonymMap.Builder parser = null;
-
-			if ("wordnet".equalsIgnoreCase(format)) {
-				parser = new WordnetSynonymParser(true, expand, analyzer);
-				((WordnetSynonymParser) parser).parse(rulesReader);
-			} else {
-				parser = new SolrSynonymParser(true, expand, analyzer);
-				((SolrSynonymParser) parser).parse(rulesReader);
-			}
+			SynonymMap.Builder parser = getSynonymParser(rulesReader, format, expand, analyzer);
 			return parser.build();
 		} catch (Exception e) {
 			logger.error("reload remote synonym {} error!", e, location);
@@ -94,7 +104,7 @@ public class RemoteSynonymFile implements SynonymFile {
 	}
 
 	/**
-	 * 从远程服务器上下载自定义词条
+     * Download custom terms from a remote server
 	 */
 	public Reader getReader() {
 		Reader reader = null;
@@ -159,7 +169,7 @@ public class RemoteSynonymFile implements SynonymFile {
 				.setConnectionRequestTimeout(10 * 1000)
 				.setConnectTimeout(10 * 1000).setSocketTimeout(15 * 1000)
 				.build();
-		HttpHead head = new HttpHead(location);
+        HttpHead head = AccessController.doPrivileged((PrivilegedAction<HttpHead>) () -> new HttpHead(location));
 		head.setConfig(rc);
 
 		// 设置请求头
@@ -174,16 +184,16 @@ public class RemoteSynonymFile implements SynonymFile {
 		try {
 			response = httpclient.execute(head);
 			if (response.getStatusLine().getStatusCode() == 200) { // 返回200 才做操作
-				if (!response.getLastHeader("Last-Modified").getValue()
+				if (!response.getLastHeader(LAST_MODIFIED_HEADER).getValue()
 						.equalsIgnoreCase(lastModified)
-						|| !response.getLastHeader("ETag").getValue()
+						|| !response.getLastHeader(ETAG_HEADER).getValue()
 								.equalsIgnoreCase(eTags)) {
 
-					lastModified = response.getLastHeader("Last-Modified") == null ? null
-							: response.getLastHeader("Last-Modified")
+					lastModified = response.getLastHeader(LAST_MODIFIED_HEADER) == null ? null
+							: response.getLastHeader(LAST_MODIFIED_HEADER)
 									.getValue();
-					eTags = response.getLastHeader("ETag") == null ? null
-							: response.getLastHeader("ETag").getValue();
+					eTags = response.getLastHeader(ETAG_HEADER) == null ? null
+							: response.getLastHeader(ETAG_HEADER).getValue();
 					return true;
 				}
 			} else if (response.getStatusLine().getStatusCode() == 304) {
